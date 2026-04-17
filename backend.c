@@ -1236,6 +1236,12 @@ static void do_io(struct thread_data *td, uint64_t *bytes_done)
 		    !td->o.experimental_verify)
 			log_io_piece(td, io_u);
 
+		if (td_randtrimwrite(td) && io_u->ddir == DDIR_TRIM &&
+		    td->o.do_verify &&
+		    td->o.verify != VERIFY_NONE &&
+		    !td->o.experimental_verify)
+			log_io_piece_trim(td, io_u);
+
 		if (td->o.io_submit_mode == IO_MODE_OFFLOAD) {
 			const unsigned long long blen = io_u->xfer_buflen;
 			const enum fio_ddir __ddir = acct_ddir(io_u);
@@ -1782,6 +1788,12 @@ static uint64_t do_dry_run(struct thread_data *td)
 		    td->o.verify != VERIFY_NONE &&
 		    !td->o.experimental_verify)
 			log_io_piece(td, io_u);
+
+		if (td_randtrimwrite(td) && io_u->ddir == DDIR_TRIM &&
+		    td->o.do_verify &&
+		    td->o.verify != VERIFY_NONE &&
+		    !td->o.experimental_verify)
+			log_io_piece_trim(td, io_u);
 
 		ret = io_u_sync_complete(td, io_u);
 		(void) ret;

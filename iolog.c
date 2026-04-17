@@ -361,6 +361,86 @@ restart:
 	td->io_hist_len++;
 }
 
+/*
+ * For randtrimwrite, when a trim is about to be issued, update the verify
+ * history for any previously written blocks at the same range.  If not
+ * verifying that trimmed ranges return zeroed data, the existing pieces are
+ * removed; otherwise they are marked as trimmed so that verify will expect
+ * zeroed data.  In-flight pieces (write not yet completed) cannot be freed
+ * safely, so they are always marked with IP_F_TRIMMED.
+ */
+void log_io_piece_trim(struct thread_data *td, const struct io_u *io_u)
+{
+	struct fio_rb_node **p, *parent;
+	struct io_piece *ipo;
+	struct flist_head *entry, *tmp;
+
+restart:
+	p = &td->io_hist_tree.rb_node;
+	parent = NULL;
+	while (*p) {
+		int overlap = 0;
+
+		parent = *p;
+		ipo = rb_entry(parent, struct io_piece, rb_node);
+
+		if (io_u->file < ipo->file)
+			p = &(*p)->rb_left;
+		else if (io_u->file > ipo->file)
+			p = &(*p)->rb_right;
+		else if (io_u->offset < ipo->offset) {
+			p = &(*p)->rb_left;
+			overlap = io_u->offset + io_u->buflen > ipo->offset;
+		} else if (io_u->offset > ipo->offset) {
+			p = &(*p)->rb_right;
+			overlap = ipo->offset + ipo->len > io_u->offset;
+		} else
+			overlap = 1;
+
+		if (overlap) {
+			dprint(FD_IO, "iolog: trim overlap %llu/%lu, %llu/%lu\n",
+				ipo->offset, ipo->len,
+				(unsigned long long) io_u->offset, io_u->buflen);
+			if (ipo->flags & IP_F_IN_FLIGHT) {
+				ipo->flags |= IP_F_TRIMMED;
+			} else if (!td->o.trim_zero) {
+				td->io_hist_len--;
+				rb_erase(parent, &td->io_hist_tree);
+				remove_trim_entry(td, ipo);
+				free(ipo);
+			} else {
+				ipo->flags |= IP_F_TRIMMED;
+			}
+			goto restart;
+		}
+	}
+
+	flist_for_each_safe(entry, tmp, &td->io_hist_list) {
+		ipo = flist_entry(entry, struct io_piece, list);
+
+		if (ipo->file != io_u->file)
+			continue;
+		if (ipo->offset + ipo->len <= io_u->offset)
+			continue;
+		if (ipo->offset >= io_u->offset + io_u->buflen)
+			continue;
+
+		dprint(FD_IO, "iolog: trim list overlap %llu/%lu, %llu/%lu\n",
+			ipo->offset, ipo->len,
+			(unsigned long long) io_u->offset, io_u->buflen);
+		if (ipo->flags & IP_F_IN_FLIGHT) {
+			ipo->flags |= IP_F_TRIMMED;
+		} else if (!td->o.trim_zero) {
+			flist_del(entry);
+			remove_trim_entry(td, ipo);
+			td->io_hist_len--;
+			free(ipo);
+		} else {
+			ipo->flags |= IP_F_TRIMMED;
+		}
+	}
+}
+
 void unlog_io_piece(struct thread_data *td, struct io_u *io_u)
 {
 	struct io_piece *ipo = io_u->ipo;

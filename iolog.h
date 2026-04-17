@@ -284,6 +284,7 @@ extern void log_io_u(const struct thread_data *, const struct io_u *);
 extern void log_file(struct thread_data *, struct fio_file *, enum file_log_act);
 extern bool __must_check init_iolog(struct thread_data *td);
 extern void log_io_piece(struct thread_data *, struct io_u *);
+extern void log_io_piece_trim(struct thread_data *, const struct io_u *);
 extern void unlog_io_piece(struct thread_data *, struct io_u *);
 extern void trim_io_piece(const struct io_u *);
 extern void queue_io_piece(struct thread_data *, struct io_piece *);
