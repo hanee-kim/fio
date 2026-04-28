@@ -295,6 +295,13 @@ void log_io_piece(struct thread_data *td, struct io_u *io_u)
 
 	io_u->ipo = ipo;
 
+	dprint(FD_IO, "log_io_piece: ipo=%p offset=%llu len=%llu numberio=%llu file=%s\n",
+		ipo,
+		(unsigned long long) ipo->offset,
+		(unsigned long long) ipo->len,
+		(unsigned long long) ipo->numberio,
+		ipo->file ? ipo->file->file_name : "(null)");
+
 	if (io_u_should_trim(td, io_u)) {
 		flist_add_tail(&ipo->trim_list, &td->trim_list);
 		td->trim_entries++;
