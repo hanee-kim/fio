@@ -1767,6 +1767,16 @@ static uint64_t do_dry_run(struct thread_data *td)
 		io_u_set(td, io_u, IO_U_F_FLIGHT);
 		io_u->error = 0;
 		io_u->resid = 0;
+
+		if (td->o.verify_state && td->vstate &&
+		    td_write(td) && io_u->ddir == DDIR_WRITE &&
+		    td->o.do_verify && td->o.verify != VERIFY_NONE &&
+		    !td->o.experimental_verify &&
+		    td->io_issues[DDIR_WRITE] >= td->vstate->numberio) {
+			clear_io_u(td, io_u);
+			break;
+		}
+
 		if (ddir_rw(acct_ddir(io_u))) {
 			io_u->numberio = td->io_issues[acct_ddir(io_u)];
 			td->io_issues[acct_ddir(io_u)]++;
@@ -1780,8 +1790,14 @@ static uint64_t do_dry_run(struct thread_data *td)
 		if (td_write(td) && io_u->ddir == DDIR_WRITE &&
 		    td->o.do_verify &&
 		    td->o.verify != VERIFY_NONE &&
-		    !td->o.experimental_verify)
-			log_io_piece(td, io_u);
+		    !td->o.experimental_verify) {
+			if (td->o.verify_state && td->vstate) {
+				if (!verify_state_should_stop(td, io_u->numberio))
+					log_io_piece(td, io_u);
+			} else {
+				log_io_piece(td, io_u);
+			}
+		}
 
 		ret = io_u_sync_complete(td, io_u);
 		(void) ret;
@@ -2137,6 +2153,15 @@ static void *thread_main(void *data)
 		fio_gettime(&td->start, NULL);
 
 		do_verify(td, verify_bytes);
+
+		/*
+		 * When verify_state_load is active the state file defines
+		 * the exact set of IOs to verify. Once that set is consumed
+		 * there is nothing left to do regardless of the configured
+		 * size, so terminate to avoid an infinite outer loop.
+		 */
+		if (td->o.verify_state && td->vstate)
+			fio_mark_td_terminate(td);
 
 		/*
 		 * See comment further up for why this is done here.
