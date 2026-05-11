@@ -2124,8 +2124,18 @@ static void *thread_main(void *data)
 		fio_gettime(&td->start, NULL);
 		fio_sem_up(stat_sem);
 
-		if (td->error || td->terminate)
+		if (td->error || td->terminate) {
+			/*
+			 * If we're exiting before the verify phase, any
+			 * io_pieces logged for verification will never be
+			 * consumed by do_verify(). Free them now to avoid
+			 * holding memory until thread exit, which can be
+			 * significant when time_based + do_verify is used
+			 * with a size larger than what runtime allows.
+			 */
+			prune_io_piece_log(td);
 			break;
+		}
 
 		if (!o->do_verify ||
 		    o->verify == VERIFY_NONE ||
@@ -2148,8 +2158,14 @@ static void *thread_main(void *data)
 		fio_gettime(&td->start, NULL);
 		fio_sem_up(stat_sem);
 
-		if (td->error || td->terminate)
+		if (td->error || td->terminate) {
+			/*
+			 * Free any io_pieces not consumed by a partial
+			 * do_verify() run (e.g. runtime expired mid-verify).
+			 */
+			prune_io_piece_log(td);
 			break;
+		}
 	}
 
 	/*
