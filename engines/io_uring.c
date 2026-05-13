@@ -25,6 +25,7 @@
 #include "cmdprio.h"
 #include "zbd.h"
 #include "nvme.h"
+#include "bsg.h"
 
 #include <sys/stat.h>
 
@@ -95,6 +96,7 @@ struct logical_block_metadata_cap {
 
 enum uring_cmd_type {
 	FIO_URING_CMD_NVME = 1,
+	FIO_URING_CMD_BSG,
 };
 
 enum uring_cmd_write_mode {
@@ -166,6 +168,10 @@ struct ioring_data {
 	struct nvme_dsm *dsm;
 	uint32_t cdw12_flags[DDIR_RWDIR_CNT];
 	struct nvme_cmd_ext_io_opts ext_opts;
+
+	/* BSG */
+	struct bsg_cmd *bc;
+	bool fua[DDIR_RWDIR_CNT];
 };
 
 struct ioring_options {
@@ -379,6 +385,10 @@ static struct fio_option options[] = {
 			    .oval = FIO_URING_CMD_NVME,
 			    .help = "Issue nvme-uring-cmd",
 			  },
+			  { .ival = "bsg",
+			    .oval = FIO_URING_CMD_BSG,
+			    .help = "Issue bsg-uring-cmd",
+			  },
 		},
 		.category = FIO_OPT_C_ENGINE,
 		.group	= FIO_OPT_G_IOURING,
@@ -591,8 +601,8 @@ static int fio_ioring_cmd_prep(struct thread_data *td, struct io_u *io_u)
 	struct fio_file *f = io_u->file;
 	struct io_uring_sqe *sqe;
 
-	/* only supports nvme_uring_cmd */
-	if (o->cmd_type != FIO_URING_CMD_NVME)
+	/* only supports nvme_uring_cmd and bsg_uring_cmd */
+	if (o->cmd_type != FIO_URING_CMD_NVME && o->cmd_type != FIO_URING_CMD_BSG)
 		return -EINVAL;
 
 	if (io_u->ddir == DDIR_TRIM && td->io_ops->flags & FIO_ASYNCIO_SYNC_TRIM)
@@ -655,6 +665,13 @@ static int fio_ioring_cmd_prep(struct thread_data *td, struct io_u *io_u)
 				o->nonvectored ? NULL : &ld->iovecs[io_u->index],
 				dsm, read_opcode, ld->write_opcode,
 				ld->cdw12_flags[io_u->ddir]);
+	} else if (o->cmd_type == FIO_URING_CMD_BSG) {
+		struct bsg_uring_cmd *cmd;
+
+		sqe->len = io_u->xfer_buflen;
+		cmd = (struct bsg_uring_cmd *)sqe->cmd;
+
+		return fio_bsg_uring_cmd_prep(cmd, io_u, &ld->bc[io_u->index], ld->fua[io_u->ddir]);
 	}
 	return -EINVAL;
 }
@@ -720,7 +737,7 @@ static struct io_u *fio_ioring_cmd_event(struct thread_data *td, int event)
 	int ret;
 
 	index = (event + ld->cq_ring_off) & ld->cq_ring_mask;
-	if (o->cmd_type == FIO_URING_CMD_NVME)
+	if (o->cmd_type == FIO_URING_CMD_NVME || o->cmd_type == FIO_URING_CMD_BSG)
 		index <<= 1;
 
 	cqe = &ld->cq_ring.cqes[index];
@@ -737,6 +754,17 @@ static struct io_u *fio_ioring_cmd_event(struct thread_data *td, int event)
 			if (ret)
 				io_u->error = ret;
 		}
+	} else if (o->cmd_type == FIO_URING_CMD_BSG) {
+		/*
+		 * For bsg uring cmd, the big_cqe[0] in cqe contains the packed
+		 * SCSI status, where bits 0-7 hold the device status and bits 16-23
+		 * contaion the host status
+		 */
+		ret = (cqe->big_cqe[0] >> 16) & 0xff;
+		if (ret)
+			io_u->error = -ret;
+		else
+			io_u->error = cqe->big_cqe[0] & 0xff;
 	}
 
 ret:
@@ -780,6 +808,17 @@ static char *fio_ioring_cmd_errdetails(struct thread_data *td,
 
 		snprintf(msgchunk, MAXMSGCHUNK, "sc=0x%02x)", sc);
 		strlcat(msg, msgchunk, MAXERRDETAIL);
+	} else if (o->cmd_type == FIO_URING_CMD_BSG) {
+		unsigned int status = io_u->error & 0xff;
+		unsigned int host_status = (io_u->error >> 16) & 0xff;
+		if (status) {
+			snprintf(msgchunk, MAXMSGCHUNK, "BSG SCSI Status: 0x%02x; ", status);
+			strlcat(msg, msgchunk, MAXERRDETAIL);
+		}
+		if (host_status) {
+			snprintf(msgchunk, MAXMSGCHUNK, "BSG Host Status: 0x%02x; ", host_status);
+			strlcat(msg, msgchunk, MAXERRDETAIL);
+		}
 	} else {
 		/* Print status code in generic */
 		snprintf(msgchunk, MAXMSGCHUNK, "status=0x%x", io_u->error);
@@ -1053,6 +1092,7 @@ static void fio_ioring_cleanup(struct thread_data *td)
 		free(ld->iovecs);
 		free(ld->fds);
 		free(ld->dsm);
+		free(ld->bc);
 		free(ld);
 	}
 }
@@ -1247,7 +1287,7 @@ static int fio_ioring_cmd_queue_init(struct thread_data *td)
 		 */
 		td->o.disable_slat = 1;
 	}
-	if (o->cmd_type == FIO_URING_CMD_NVME) {
+	if (o->cmd_type == FIO_URING_CMD_NVME || o->cmd_type == FIO_URING_CMD_BSG) {
 		p.flags |= IORING_SETUP_SQE128;
 		p.flags |= IORING_SETUP_CQE32;
 	}
@@ -1413,7 +1453,7 @@ static int fio_ioring_cmd_post_init(struct thread_data *td)
 	for (i = 0; i < ld->iodepth; i++) {
 		struct io_uring_sqe *sqe;
 
-		if (o->cmd_type == FIO_URING_CMD_NVME) {
+		if (o->cmd_type == FIO_URING_CMD_NVME || o->cmd_type == FIO_URING_CMD_BSG) {
 			sqe = &ld->sqes[i << 1];
 			memset(sqe, 0, 2 * sizeof(*sqe));
 		} else {
@@ -1474,6 +1514,23 @@ static int fio_ioring_cmd_init(struct thread_data *td, struct ioring_data *ld)
 			ld->cdw12_flags[DDIR_READ] = 1 << 30;
 		if (o->writefua)
 			ld->cdw12_flags[DDIR_WRITE] = 1 << 30;
+	} else if (o->cmd_type == FIO_URING_CMD_BSG) {
+		ld->bc = calloc(td->o.iodepth, sizeof(struct bsg_cmd));
+
+		if (td_write(td)) {
+			if (o->write_mode == FIO_URING_CMD_WMODE_WRITE) {
+				ld->write_opcode = bsg_cmd_write_10;
+			} else {
+				log_err("Not Support Write mode in BSG io_uring_cmd\n");
+				td_verror(td, EINVAL, "fio_ioring_cmd_init");
+				return 1;
+			}
+		}
+
+		if (o->readfua)
+			ld->fua[DDIR_READ] = 1;
+		if (o->writefua)
+			ld->fua[DDIR_WRITE] = 1;
 	}
 
 	return 0;
@@ -1855,6 +1912,23 @@ static int fio_ioring_cmd_open_file(struct thread_data *td, struct fio_file *f)
 		ret = fio_ioring_open_nvme(td, f);
 		if (ret)
 			return ret;
+	} else if (o->cmd_type == FIO_URING_CMD_BSG) {
+		struct bsg_data *data;
+		unsigned int bs = 0;
+		unsigned long long last_lba = 0;
+		int ret;
+
+		data = FILE_ENG_DATA(f);
+		if (data == NULL) {
+			data = calloc(1, sizeof(struct bsg_data));
+			ret = fio_bsg_uring_cmd_read_capacity(td, &bs, &last_lba);
+			if (ret) {
+				free(data);
+				return ret;
+			}
+			data->bs = bs;
+			FILE_SET_ENG_DATA(f, data);
+		}
 	}
 
 	return fio_ioring_open_file(td, f);
@@ -1879,6 +1953,11 @@ static int fio_ioring_cmd_close_file(struct thread_data *td,
 
 	if (o->cmd_type == FIO_URING_CMD_NVME) {
 		struct nvme_data *data = FILE_ENG_DATA(f);
+
+		FILE_SET_ENG_DATA(f, NULL);
+		free(data);
+	} else if (o->cmd_type == FIO_URING_CMD_BSG) {
+		struct bsg_data *data = FILE_ENG_DATA(f);
 
 		FILE_SET_ENG_DATA(f, NULL);
 		free(data);
@@ -1912,6 +1991,26 @@ static int fio_ioring_cmd_get_file_size(struct thread_data *td,
 		else
 			f->real_file_size = data->lba_size * nlba;
 		fio_file_set_size_known(f);
+
+		FILE_SET_ENG_DATA(f, data);
+		return 0;
+	} else if (o->cmd_type == FIO_URING_CMD_BSG) {
+		struct bsg_data *data = NULL;
+		unsigned int bs = 0;
+		unsigned long long last_lba = 0;
+		int ret;
+
+		data = calloc(1, sizeof(struct bsg_data));
+		ret = fio_bsg_uring_cmd_read_capacity(td, &bs, &last_lba);
+		if (ret) {
+			free(data);
+			return ret;
+		}
+
+		f->real_file_size = (last_lba + 1) * bs;
+		fio_file_set_size_known(f);
+
+		data->bs = bs;
 
 		FILE_SET_ENG_DATA(f, data);
 		return 0;
