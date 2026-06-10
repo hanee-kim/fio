@@ -1809,6 +1809,7 @@ static void *thread_main(void *data)
 	uint64_t bytes_done[DDIR_RWDIR_CNT];
 	int deadlock_loop_cnt;
 	bool clear_state;
+	bool startup_sem_posted = false;
 	int ret;
 
 	sk_out_assign(sk_out);
@@ -1852,6 +1853,7 @@ static void *thread_main(void *data)
 	td_set_runstate(td, TD_INITIALIZED);
 	dprint(FD_MUTEX, "up startup_sem\n");
 	fio_sem_up(startup_sem);
+	startup_sem_posted = true;
 	dprint(FD_MUTEX, "wait on td->sem\n");
 	fio_sem_down(td->sem);
 	dprint(FD_MUTEX, "done waiting on td->sem\n");
@@ -2197,10 +2199,16 @@ static void *thread_main(void *data)
 	if (o->exec_postrun)
 		exec_string(o, o->exec_postrun, "postrun");
 
+err:
+	if (!startup_sem_posted)
+		fio_sem_up(startup_sem);
+
+	if (!td->error)
+		td_verror(td, EIO, "job init failed");
+
 	if (exitall_on_terminate || (o->exitall_error && td->error))
 		fio_terminate_threads(td->groupid, td->o.exit_what);
 
-err:
 	if (td->error)
 		log_info("fio: pid=%d, err=%d/%s\n", (int) td->pid, td->error,
 							td->verror);
@@ -2563,9 +2571,12 @@ static void run_threads(struct sk_out *sk_out)
 		if (setup_files(td)) {
 reap:
 			exit_value++;
-			if (td->error)
-				log_err("fio: pid=%d, err=%d/%s\n",
-					(int) td->pid, td->error, td->verror);
+			if (!td->error)
+				td_verror(td, EIO, "job setup failed");
+			log_err("fio: pid=%d, err=%d/%s\n",
+				(int) td->pid, td->error, td->verror);
+			if (exitall_on_terminate || (td->o.exitall_error && td->error))
+				fio_terminate_threads(td->groupid, td->o.exit_what);
 			td_set_runstate(td, TD_REAPED);
 			todo--;
 		} else {
