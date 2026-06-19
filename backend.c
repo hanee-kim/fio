@@ -1777,6 +1777,12 @@ static uint64_t do_dry_run(struct thread_data *td)
 			td->ts.total_io_u[io_u->ddir]++;
 		}
 
+		dprint(FD_IO, "do_dry_run: ddir=%s offset=%llu len=%llu file=%s\n",
+			io_ddir_name(io_u->ddir),
+			(unsigned long long) io_u->offset,
+			(unsigned long long) io_u->buflen,
+			io_u->file ? io_u->file->file_name : "(null)");
+
 		if (td_write(td) && io_u->ddir == DDIR_WRITE &&
 		    td->o.do_verify &&
 		    td->o.verify != VERIFY_NONE &&
